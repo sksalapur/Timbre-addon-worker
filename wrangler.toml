@@ -5,7 +5,7 @@ compatibility_flags = ["nodejs_compat"]
 
 [vars]
 DAILY_LIMIT = "250"
-BOT_USERNAME = "TimbreLosslessBot"
+BOT_USERNAME = "Timbre_Lossless_Bot"
 UPSTREAM_SEARCH_URL = "https://qobuz-dll.vercel.app/api/get-music"
 UPSTREAM_DOWNLOAD_URL = "https://qobuz-dll.vercel.app/api/download-music"
 

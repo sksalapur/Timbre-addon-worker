@@ -367,7 +367,7 @@ Please update this URL in **Timbre** ➔ **Settings** ➔ **Sources**.`,
 • /reset — Revoke your token and generate a new private URL
 • /help — Show this help message
 
-For full setup documentation, visit sksalapur.github.io/Timbre/addons.html`,
+For full setup documentation, visit https://sksalapur.github.io/Timbre/`,
               parse_mode: "Markdown"
             });
             return new Response("OK");
@@ -553,7 +553,7 @@ Make sure to replace this in Timbre ➔ Settings ➔ Sources.`,
         const currentCount = await getStreamCount(env, token, today);
         if (currentCount >= limit) {
           return new Response(JSON.stringify({
-            error: `Daily limit of ${limit} songs reached. Quota resets at 00:00 UTC. Check @${env.BOT_USERNAME || "TimbreLosslessBot"} for status.`
+            error: `Daily limit of ${limit} songs reached. Quota resets at 00:00 UTC. Check @${env.BOT_USERNAME || "Timbre_Lossless_Bot"} for status.`
           }), {
             status: 429,
             headers: { "Content-Type": "application/json", ...corsHeaders }
@@ -601,7 +601,7 @@ Make sure to replace this in Timbre ➔ Settings ➔ Sources.`,
 
     // Landing Page
     if (path === "/" || path === "/health") {
-      const botName = env.BOT_USERNAME || "TimbreLosslessBot";
+      const botName = env.BOT_USERNAME || "Timbre_Lossless_Bot";
       const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
