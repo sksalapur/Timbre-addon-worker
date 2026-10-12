@@ -1,0 +1,15 @@
+﻿name = "timbre-lossless-worker"
+main = "src/index.ts"
+compatibility_date = "2024-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+DAILY_LIMIT = "250"
+BOT_USERNAME = "TimbreLosslessBot"
+UPSTREAM_SEARCH_URL = "https://qobuz-dll.vercel.app/api/get-music"
+UPSTREAM_DOWNLOAD_URL = "https://qobuz-dll.vercel.app/api/download-music"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "timbre-db"
+database_id = "5975b26f-8b05-4ae8-950c-6ba46dc3eec9"

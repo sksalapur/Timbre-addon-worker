@@ -1,0 +1,6 @@
+﻿node_modules/
+.wrangler/
+.env
+dist/
+test_bundle.js
+*.log
