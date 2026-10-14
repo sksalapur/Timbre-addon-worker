@@ -567,7 +567,7 @@ Make sure to replace this in Timbre ➔ Settings ➔ Sources.`,
         }
 
         const cleaned = cleanQuery(query);
-        const upstreamSearch = env.UPSTREAM_SEARCH_URL || "https://qobuz-dll.vercel.app/api/get-music";
+        const upstreamSearch = env.UPSTREAM_SEARCH_URL || "https://qobuz-dll.foreyou.workers.dev/api/get-music";
 
         const trySearch = async (searchTerm: string): Promise<any[]> => {
           try {
@@ -649,7 +649,7 @@ Make sure to replace this in Timbre ➔ Settings ➔ Sources.`,
 
         await incrementStreamCount(env, token, today);
 
-        const upstreamDownload = env.UPSTREAM_DOWNLOAD_URL || "https://qobuz-dll.vercel.app/api/download-music";
+        const upstreamDownload = env.UPSTREAM_DOWNLOAD_URL || "https://qobuz-dll.foreyou.workers.dev/api/download-music";
         try {
           const dlReq = await fetch(`${upstreamDownload}?track_id=${encodeURIComponent(trackId)}&quality=27`, {
             headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
