@@ -514,20 +514,18 @@ Make sure to replace this in Timbre ➔ Settings ➔ Sources.`,
       const token = userMatch[1];
       const subPath = userMatch[2] || "";
 
-      const user = await getUserByToken(env, token);
-      if (!user) {
-        return new Response(JSON.stringify({ error: "Unauthorized: Invalid or revoked private token" }), {
-          status: 401,
-          headers: { "Content-Type": "application/json", ...corsHeaders }
-        });
-      }
-
-      // Manifest
+      // Ultra-Fast Path for Manifest & Health Checks (<5ms edge response, zero D1 roundtrip)
       if (subPath === "/manifest.json" || subPath === "") {
+        if (!token || token.length < 16) {
+          return new Response(JSON.stringify({ error: "Unauthorized: Invalid token format" }), {
+            status: 401,
+            headers: { "Content-Type": "application/json", ...corsHeaders }
+          });
+        }
         const manifest = {
           id: "timbre-lossless",
           name: "Timbre Cloudflare Edge (FLAC)",
-          version: "1.8.0",
+          version: "1.8-2",
           description: "Studio Hi-Res Lossless 24-bit FLAC streams for Timbre",
           resources: ["search", "stream"],
           settings: [
@@ -545,6 +543,15 @@ Make sure to replace this in Timbre ➔ Settings ➔ Sources.`,
           checkValidLossless: false
         };
         return new Response(JSON.stringify(manifest), {
+          headers: { "Content-Type": "application/json", ...corsHeaders }
+        });
+      }
+
+      // Authenticate user for search and stream endpoints
+      const user = await getUserByToken(env, token);
+      if (!user) {
+        return new Response(JSON.stringify({ error: "Unauthorized: Invalid or revoked private token" }), {
+          status: 401,
           headers: { "Content-Type": "application/json", ...corsHeaders }
         });
       }

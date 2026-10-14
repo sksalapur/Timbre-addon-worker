@@ -1,6 +1,6 @@
-﻿{
+{
   "name": "timbre-lossless-worker",
-  "version": "1.0.0",
+  "version": "1.8-2",
   "description": "Authenticated Cloudflare Worker and Telegram Bot for Timbre Hi-Res Lossless FLAC Addon",
   "main": "src/index.ts",
   "scripts": {
