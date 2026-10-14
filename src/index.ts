@@ -5,6 +5,7 @@ export interface Env {
   BOT_USERNAME?: string;
   UPSTREAM_SEARCH_URL?: string;
   UPSTREAM_DOWNLOAD_URL?: string;
+  UPSTREAM_BRIDGE_URL?: string;
   SETUP_SECRET?: string;
 }
 
@@ -20,6 +21,35 @@ interface UserRecord {
 const memUsersByTgId = new Map<number, UserRecord>();
 const memUsersByToken = new Map<string, UserRecord>();
 const memDailyStreams = new Map<string, number>();
+
+// In-memory Edge Caching for ultra-low latency (<50ms)
+interface CachedUser {
+  user: UserRecord;
+  cachedAt: number;
+}
+const tokenCache = new Map<string, CachedUser>();
+const TOKEN_CACHE_TTL = 15 * 60 * 1000; // 15 mins
+
+interface CacheEntry<T> {
+  data: T;
+  cachedAt: number;
+}
+const searchCache = new Map<string, CacheEntry<any>>();
+const SEARCH_CACHE_TTL = 15 * 60 * 1000; // 15 mins
+
+const streamCache = new Map<string, CacheEntry<any>>();
+const STREAM_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+
+// Title cleaning helper to match Lossless Bridge clean query logic
+function cleanQuery(query: string): string {
+  let cleaned = query
+    .replace(/[\(\[\{](?:official\s*(?:music\s*)?video|official\s*audio|lyric\s*video|audio|visualizer|mv|remaster(?:ed)?(?:\s*\d{4})?|video|live)[^\)\]\}]*[\)\]\}]/gi, "")
+    .replace(/\b(?:official\s*(?:music\s*)?video|official\s*audio|lyric\s*video|visualizer|mv)\b/gi, "")
+    .replace(/[\s\-_|:]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || query;
+}
 
 function getTodayUTC(): string {
   return new Date().toISOString().slice(0, 10);
@@ -51,17 +81,30 @@ async function getUserByTelegramId(env: Env, telegramId: number): Promise<UserRe
 }
 
 async function getUserByToken(env: Env, token: string): Promise<UserRecord | null> {
+  const cached = tokenCache.get(token);
+  if (cached && (Date.now() - cached.cachedAt < TOKEN_CACHE_TTL)) {
+    return cached.user;
+  }
+
   if (env.DB) {
     try {
       const res = await env.DB.prepare("SELECT telegram_id, username, first_name, token, created_at FROM users WHERE token = ?")
         .bind(token)
         .first<UserRecord>();
-      return res || null;
+      if (res) {
+        tokenCache.set(token, { user: res, cachedAt: Date.now() });
+        return res;
+      }
     } catch (e) {
       console.error("D1 getUserByToken error:", e);
     }
   }
-  return memUsersByToken.get(token) || null;
+
+  const fallback = memUsersByToken.get(token) || null;
+  if (fallback) {
+    tokenCache.set(token, { user: fallback, cachedAt: Date.now() });
+  }
+  return fallback;
 }
 
 async function saveUser(env: Env, user: UserRecord): Promise<void> {
@@ -78,6 +121,7 @@ async function saveUser(env: Env, user: UserRecord): Promise<void> {
   }
   memUsersByTgId.set(user.telegram_id, user);
   memUsersByToken.set(user.token, user);
+  tokenCache.set(user.token, { user, cachedAt: Date.now() });
 }
 
 async function getStreamCount(env: Env, token: string, date: string): Promise<number> {
@@ -505,7 +549,7 @@ Make sure to replace this in Timbre ➔ Settings ➔ Sources.`,
         });
       }
 
-      // Search
+      // Search (with in-memory cache and cleanQuery title normalization)
       if (subPath.startsWith("/search")) {
         const query = url.searchParams.get("q") || "";
         if (!query.trim()) {
@@ -514,37 +558,73 @@ Make sure to replace this in Timbre ➔ Settings ➔ Sources.`,
           });
         }
 
-        const upstreamSearch = env.UPSTREAM_SEARCH_URL || "https://qobuz-dll.vercel.app/api/get-music";
-        try {
-          const searchReq = await fetch(`${upstreamSearch}?q=${encodeURIComponent(query)}&offset=0`, {
-            headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
-          });
-          const searchData = await searchReq.json<any>();
-          const items = searchData?.data?.tracks?.items || [];
-
-          const tracks = items.map((item: any) => ({
-            id: String(item.id),
-            title: item.title || "",
-            artist: item.performer?.name || "",
-            album: item.album?.title || "",
-            duration: item.duration || 0,
-            artworkURL: item.album?.image?.large || item.album?.image?.small || "",
-            format: "flac",
-            audioQuality: "LOSSLESS"
-          }));
-
-          return new Response(JSON.stringify({ tracks }), {
-            headers: { "Content-Type": "application/json", ...corsHeaders }
-          });
-        } catch (err: any) {
-          console.error("Search error:", err);
-          return new Response(JSON.stringify({ tracks: [] }), {
+        const cacheKey = query.trim().toLowerCase();
+        const cachedSearch = searchCache.get(cacheKey);
+        if (cachedSearch && (Date.now() - cachedSearch.cachedAt < SEARCH_CACHE_TTL)) {
+          return new Response(JSON.stringify({ tracks: cachedSearch.data }), {
             headers: { "Content-Type": "application/json", ...corsHeaders }
           });
         }
+
+        const cleaned = cleanQuery(query);
+        const upstreamSearch = env.UPSTREAM_SEARCH_URL || "https://qobuz-dll.vercel.app/api/get-music";
+
+        const trySearch = async (searchTerm: string): Promise<any[]> => {
+          try {
+            const searchReq = await fetch(`${upstreamSearch}?q=${encodeURIComponent(searchTerm)}&offset=0`, {
+              headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+            });
+            if (!searchReq.ok) return [];
+            const searchData = await searchReq.json<any>();
+            const items = searchData?.data?.tracks?.items || [];
+            return items.map((item: any) => ({
+              id: String(item.id),
+              title: item.title || "",
+              artist: item.performer?.name || "",
+              album: item.album?.title || "",
+              duration: item.duration || 0,
+              artworkURL: item.album?.image?.large || item.album?.image?.small || "",
+              format: "flac",
+              audioQuality: "LOSSLESS"
+            }));
+          } catch (err) {
+            console.error(`Search error for '${searchTerm}':`, err);
+            return [];
+          }
+        };
+
+        // 1. Try cleaned query first
+        let tracks = await trySearch(cleaned);
+
+        // 2. Fallback to raw query if cleaned had 0 results
+        if (tracks.length === 0 && cleaned !== query) {
+          tracks = await trySearch(query);
+        }
+
+        // 3. Fallback to UPSTREAM_BRIDGE_URL if configured and Vercel/Qobuz failed
+        if (tracks.length === 0 && env.UPSTREAM_BRIDGE_URL) {
+          try {
+            const bridgeUrl = `${env.UPSTREAM_BRIDGE_URL.replace(/\/+$/, "")}/search?q=${encodeURIComponent(cleaned)}`;
+            const bReq = await fetch(bridgeUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+            if (bReq.ok) {
+              const bData = await bReq.json<any>();
+              if (Array.isArray(bData?.tracks)) {
+                tracks = bData.tracks;
+              }
+            }
+          } catch (bErr) {
+            console.error("Bridge search fallback error:", bErr);
+          }
+        }
+
+        searchCache.set(cacheKey, { data: tracks, cachedAt: Date.now() });
+
+        return new Response(JSON.stringify({ tracks }), {
+          headers: { "Content-Type": "application/json", ...corsHeaders }
+        });
       }
 
-      // Stream
+      // Stream (with in-memory cache and bridge fallback)
       const streamMatch = subPath.match(/^\/stream\/(.+)$/);
       if (streamMatch) {
         const trackId = streamMatch[1];
@@ -560,6 +640,13 @@ Make sure to replace this in Timbre ➔ Settings ➔ Sources.`,
           });
         }
 
+        const cachedStream = streamCache.get(trackId);
+        if (cachedStream && (Date.now() - cachedStream.cachedAt < STREAM_CACHE_TTL)) {
+          return new Response(JSON.stringify(cachedStream.data), {
+            headers: { "Content-Type": "application/json", ...corsHeaders }
+          });
+        }
+
         await incrementStreamCount(env, token, today);
 
         const upstreamDownload = env.UPSTREAM_DOWNLOAD_URL || "https://qobuz-dll.vercel.app/api/download-music";
@@ -570,32 +657,47 @@ Make sure to replace this in Timbre ➔ Settings ➔ Sources.`,
           const dlData = await dlReq.json<any>();
           const data = dlData?.data;
 
-          if (!data?.url) {
-            return new Response(JSON.stringify({ error: "Stream not available from lossless provider" }), {
-              status: 404,
+          if (data?.url) {
+            const responseStream = {
+              url: data.url,
+              format: "flac",
+              quality: "LOSSLESS",
+              bitDepth: data.bit_depth || 24,
+              sampleRate: data.sampling_rate ? data.sampling_rate * 1000 : 96000,
+              codec: "flac"
+            };
+            streamCache.set(trackId, { data: responseStream, cachedAt: Date.now() });
+            return new Response(JSON.stringify(responseStream), {
               headers: { "Content-Type": "application/json", ...corsHeaders }
             });
           }
-
-          const responseStream = {
-            url: data.url,
-            format: "flac",
-            quality: "LOSSLESS",
-            bitDepth: data.bit_depth || 24,
-            sampleRate: data.sampling_rate ? data.sampling_rate * 1000 : 96000,
-            codec: "flac"
-          };
-
-          return new Response(JSON.stringify(responseStream), {
-            headers: { "Content-Type": "application/json", ...corsHeaders }
-          });
         } catch (err: any) {
-          console.error("Stream error:", err);
-          return new Response(JSON.stringify({ error: "Failed to resolve stream" }), {
-            status: 502,
-            headers: { "Content-Type": "application/json", ...corsHeaders }
-          });
+          console.error("Primary stream resolution error:", err);
         }
+
+        // Fallback to UPSTREAM_BRIDGE_URL if configured
+        if (env.UPSTREAM_BRIDGE_URL) {
+          try {
+            const bridgeStreamUrl = `${env.UPSTREAM_BRIDGE_URL.replace(/\/+$/, "")}/stream/${encodeURIComponent(trackId)}`;
+            const bReq = await fetch(bridgeStreamUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+            if (bReq.ok) {
+              const bData = await bReq.json<any>();
+              if (bData?.url) {
+                streamCache.set(trackId, { data: bData, cachedAt: Date.now() });
+                return new Response(JSON.stringify(bData), {
+                  headers: { "Content-Type": "application/json", ...corsHeaders }
+                });
+              }
+            }
+          } catch (bErr) {
+            console.error("Bridge stream fallback error:", bErr);
+          }
+        }
+
+        return new Response(JSON.stringify({ error: "Stream not available from lossless provider" }), {
+          status: 404,
+          headers: { "Content-Type": "application/json", ...corsHeaders }
+        });
       }
     }
 
