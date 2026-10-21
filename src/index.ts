@@ -318,6 +318,11 @@ export default {
             return new Response("OK");
           }
 
+          // Strict chat-type guard: ignore any messages from groups/channels
+          if (msg.chat?.type && msg.chat.type !== "private") {
+            return new Response("OK");
+          }
+
           if (text === "/start" || text.startsWith("/start ") || text === "/login") {
             let user = await getUserByTelegramId(env, from.id);
             if (!user) {
