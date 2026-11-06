@@ -1,46 +1,37 @@
+// @ts-ignore
+import { createBitChordAuth } from "./bitchord-addon-auth.mjs";
+
 export interface Env {
-  DB?: D1Database;
-  TELEGRAM_BOT_TOKEN?: string;
-  DAILY_LIMIT?: string;
-  BOT_USERNAME?: string;
-  UPSTREAM_SEARCH_URL?: string;
-  UPSTREAM_DOWNLOAD_URL?: string;
+  LASTWAVE_URL?: string;
+  LASTWAVE_SECRET?: string;
   UPSTREAM_BRIDGE_URL?: string;
-  SETUP_SECRET?: string;
+  UPSTREAM_QOBUZ_URL?: string;
+  RESOLVER_PRIORITY?: string;
+  BITCHORD_AUTH_MODE?: string;
+  BITCHORD_HOSTS?: string;
 }
 
-interface UserRecord {
-  telegram_id: number;
-  username: string;
-  first_name: string;
-  token: string;
-  created_at: number;
-}
+const DEFAULT_LASTWAVE_URL = "https://lastwaveaddons.clashprojects.qd.je/a/4577b43d1be84f289dc05c9f794a8e992f0a58b99b2db3a49096a77ea22c911e";
+const DEFAULT_LASTWAVE_SECRET = "36d96a751b12ee481c281a8a8e64c482d0c1634a22061ab72f40175017818b85";
+const DEFAULT_BRIDGE_URL = "https://lossless-bridge.fly.dev/sksalapur";
+const DEFAULT_HOSTS = ["timbre-lossless-worker.sksalapur.workers.dev"];
 
-// Memory fallbacks for local dev without D1
-const memUsersByTgId = new Map<number, UserRecord>();
-const memUsersByToken = new Map<string, UserRecord>();
-const memDailyStreams = new Map<string, number>();
+const bitchordAuth = createBitChordAuth({
+  hosts: DEFAULT_HOSTS
+});
 
-// In-memory Edge Caching for ultra-low latency (<50ms)
-interface CachedUser {
-  user: UserRecord;
-  cachedAt: number;
-}
-const tokenCache = new Map<string, CachedUser>();
-const TOKEN_CACHE_TTL = 15 * 60 * 1000; // 15 mins
-
+// In-memory Edge Caching
 interface CacheEntry<T> {
   data: T;
   cachedAt: number;
 }
 const searchCache = new Map<string, CacheEntry<any>>();
-const SEARCH_CACHE_TTL = 15 * 60 * 1000; // 15 mins
+const SEARCH_CACHE_TTL = 30 * 60 * 1000; // 30 mins
 
 const streamCache = new Map<string, CacheEntry<any>>();
 const STREAM_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
-// Title cleaning helper to match Lossless Bridge clean query logic
+// Title cleaning helper to match BitChord clean query logic
 function cleanQuery(query: string): string {
   let cleaned = query
     .replace(/[\(\[\{](?:official\s*(?:music\s*)?video|official\s*audio|lyric\s*video|audio|visualizer|mv|remaster(?:ed)?(?:\s*\d{4})?|video|live)[^\)\]\}]*[\)\]\}]/gi, "")
@@ -51,211 +42,84 @@ function cleanQuery(query: string): string {
   return cleaned || query;
 }
 
-function getTodayUTC(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function getTimeUntilReset(): { hours: number; minutes: number } {
-  const now = new Date();
-  const hours = 23 - now.getUTCHours();
-  const minutes = 59 - now.getUTCMinutes();
-  return { hours, minutes };
-}
-
-function generateSecureToken(): string {
-  return crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "").slice(0, 8);
-}
-
-async function getUserByTelegramId(env: Env, telegramId: number): Promise<UserRecord | null> {
-  if (env.DB) {
-    try {
-      const res = await env.DB.prepare("SELECT telegram_id, username, first_name, token, created_at FROM users WHERE telegram_id = ?")
-        .bind(telegramId)
-        .first<UserRecord>();
-      return res || null;
-    } catch (e) {
-      console.error("D1 getUserByTelegramId error:", e);
+// Score tracks so 24-bit 192k / 96k Hi-Res masters rank above 16-bit 44.1k
+function qualityScore(track: any): number {
+  let bitDepth = Number(track.bitDepth) || 0;
+  let sampleRate = Number(track.sampleRate) || 0;
+  if (!bitDepth) {
+    const q = ((track.quality || "") + " " + (track.audioQuality || "")).toUpperCase();
+    if (q.includes("HI_RES") || q.includes("HI-RES") || q.includes("HIRES")) {
+      bitDepth = 24;
+      sampleRate = sampleRate || 96000;
+    } else {
+      bitDepth = 16;
+      sampleRate = sampleRate || 44100;
     }
   }
-  return memUsersByTgId.get(telegramId) || null;
+  if (!sampleRate) {
+    sampleRate = bitDepth > 16 ? 96000 : 44100;
+  }
+  return bitDepth * 1_000_000 + sampleRate;
 }
 
-async function getUserByToken(env: Env, token: string): Promise<UserRecord | null> {
-  const cached = tokenCache.get(token);
-  if (cached && (Date.now() - cached.cachedAt < TOKEN_CACHE_TTL)) {
-    return cached.user;
-  }
+// HMAC-SHA256 signer using standard WebCrypto API native to Cloudflare Workers
+async function getSignedLastWaveHeaders(targetUrl: string, method: string, secretKey: string): Promise<Record<string, string>> {
+  const parsed = new URL(targetUrl);
+  const path = parsed.pathname;
+  const match = path.match(/\/a\/([^/]+)/);
+  const token = match ? match[1] : "";
+  const ts = Math.floor(Date.now() / 1000).toString();
+  const message = `${ts}\n${method.toUpperCase()}\n${path}\n${token}`;
 
-  if (env.DB) {
-    try {
-      const res = await env.DB.prepare("SELECT telegram_id, username, first_name, token, created_at FROM users WHERE token = ?")
-        .bind(token)
-        .first<UserRecord>();
-      if (res) {
-        tokenCache.set(token, { user: res, cachedAt: Date.now() });
-        return res;
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secretKey),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sigBuffer = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+  const hashArray = Array.from(new Uint8Array(sigBuffer));
+  const signature = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
+
+  return {
+    "X-LW-TS": ts,
+    "X-LW-Sign": signature,
+    "User-Agent": "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36 LastWave/1.0",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9"
+  };
+}
+
+function getManifest(isAuthMode: boolean = false) {
+  const base = {
+    id: isAuthMode ? "lossless-edge-auth" : "lossless-edge",
+    name: isAuthMode ? "Lossless Edge (Auth)" : "Lossless Edge",
+    version: "2.1.0",
+    description: "High-Performance Parallel Lossless FLAC & DASH Audio Source for BitChord",
+    resources: ["search", "stream"],
+    allowDownloads: 1,
+    checkValidLossless: 0,
+    settings: [
+      {
+        key: "quality",
+        type: "select",
+        label: "Audio Quality",
+        default: "hires",
+        options: [
+          { value: "hires", label: "Hi-Res Lossless (Up to 24-bit/192kHz FLAC)" },
+          { value: "lossless", label: "Lossless (16-bit/44.1kHz FLAC)" },
+          { value: "high", label: "High Quality (320 kbps AAC)" }
+        ]
       }
-    } catch (e) {
-      console.error("D1 getUserByToken error:", e);
-    }
-  }
-
-  const fallback = memUsersByToken.get(token) || null;
-  if (fallback) {
-    tokenCache.set(token, { user: fallback, cachedAt: Date.now() });
-  }
-  return fallback;
-}
-
-async function saveUser(env: Env, user: UserRecord): Promise<void> {
-  if (env.DB) {
-    try {
-      await env.DB.prepare(
-        "INSERT INTO users (telegram_id, username, first_name, token, created_at) VALUES (?, ?, ?, ?, ?) " +
-        "ON CONFLICT(telegram_id) DO UPDATE SET username = excluded.username, first_name = excluded.first_name, token = excluded.token"
-      ).bind(user.telegram_id, user.username, user.first_name, user.token, user.created_at).run();
-      return;
-    } catch (e) {
-      console.error("D1 saveUser error:", e);
-    }
-  }
-  memUsersByTgId.set(user.telegram_id, user);
-  memUsersByToken.set(user.token, user);
-  tokenCache.set(user.token, { user, cachedAt: Date.now() });
-}
-
-async function getStreamCount(env: Env, token: string, date: string): Promise<number> {
-  if (env.DB) {
-    try {
-      const row = await env.DB.prepare("SELECT count FROM stream_logs WHERE token = ? AND date = ?")
-        .bind(token, date)
-        .first<{ count: number }>();
-      return row?.count ?? 0;
-    } catch (e) {
-      console.error("D1 getStreamCount error:", e);
-    }
-  }
-  return memDailyStreams.get(`${token}:${date}`) ?? 0;
-}
-
-async function incrementStreamCount(env: Env, token: string, date: string): Promise<number> {
-  if (env.DB) {
-    try {
-      await env.DB.prepare(
-        "INSERT INTO stream_logs (token, date, count) VALUES (?, ?, 1) " +
-        "ON CONFLICT(token, date) DO UPDATE SET count = count + 1"
-      ).bind(token, date).run();
-      const updated = await env.DB.prepare("SELECT count FROM stream_logs WHERE token = ? AND date = ?")
-        .bind(token, date)
-        .first<{ count: number }>();
-      return updated?.count ?? 1;
-    } catch (e) {
-      console.error("D1 incrementStreamCount error:", e);
-    }
-  }
-  const key = `${token}:${date}`;
-  const curr = (memDailyStreams.get(key) ?? 0) + 1;
-  memDailyStreams.set(key, curr);
-  return curr;
-}
-
-// Telegram Bot API helpers
-async function sendTelegram(botToken: string, method: string, payload: any): Promise<any> {
-  const cleanToken = botToken.trim();
-  const url = `https://api.telegram.org/bot${cleanToken}/${method}`;
-  try {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const raw = await resp.text();
-    try {
-      return JSON.parse(raw);
-    } catch {
-      console.error("Non-JSON from Telegram:", raw);
-      return { ok: false, description: raw };
-    }
-  } catch (err) {
-    console.error(`Telegram ${method} fetch error:`, err);
-    return { ok: false, error: err };
-  }
-}
-
-function makeStartMessage(addonUrl: string, limit: number): { text: string; reply_markup: any } {
-  const text =
-`🎵 *Welcome to Timbre Hi-Res Lossless!*
-
-Your private, authenticated FLAC stream URL has been generated:
-
-\`${addonUrl}\`
-_(Tap the URL above to copy)_
-
-━━━━━━━━━━━━━━━━━━━━
-📱 *How to Add to Timbre:*
-1. Open **Timbre** on your device.
-2. Go to **Settings** ➔ **Sources** ➔ **Add Source** ➔ **Custom Addon**.
-3. Paste your private URL above and tap **Save**.
-
-⚡ *Features & Quota:*
-• 🎧 **Studio-Quality 24-bit / 96–192kHz FLAC**
-• 📊 Quota: *${limit} streams / day*
-• 🔄 Resets daily at *00:00 UTC*
-• 🔒 Fully private in-bot dashboard — zero web browser login required!`;
-
-  const reply_markup = {
-    inline_keyboard: [
-      [
-        { text: "📊 Check Usage / Quota", callback_data: "check_quota" },
-        { text: "🔗 My Addon URL", callback_data: "get_url" }
-      ],
-      [
-        { text: "🔄 Reset URL", callback_data: "reset_url" },
-        { text: "📖 Community Group", url: "https://t.me/Timbre_Community" }
-      ]
     ]
   };
 
-  return { text, reply_markup };
-}
-
-function makeQuotaMessage(used: number, limit: number, addonUrl: string): { text: string; reply_markup: any } {
-  const remaining = Math.max(0, limit - used);
-  const { hours, minutes } = getTimeUntilReset();
-  const percentage = Math.min(100, Math.round((used / limit) * 100));
-
-  const totalBars = 10;
-  const filledBars = Math.min(totalBars, Math.round((used / limit) * totalBars));
-  const emptyBars = totalBars - filledBars;
-  const progressBar = "▓".repeat(filledBars) + "░".repeat(emptyBars);
-
-  const text =
-`📊 *Timbre Stream Quota Status*
-
-Usage: [${progressBar}] *${percentage}%*
-
-• 🎧 Streams today: *${used} / ${limit}*
-• ⏳ Remaining: *${remaining} songs*
-• 🔄 Daily reset in: *${hours}h ${minutes}m* (at 00:00 UTC)
-
-━━━━━━━━━━━━━━━━━━━━
-🔗 *Your Private Addon URL:*
-\`${addonUrl}\`
-_(Tap to copy)_`;
-
-  const reply_markup = {
-    inline_keyboard: [
-      [
-        { text: "🔄 Refresh Status", callback_data: "check_quota" },
-        { text: "🔄 Regenerate URL", callback_data: "reset_url" }
-      ],
-      [
-        { text: "📖 Community Group", url: "https://t.me/Timbre_Community" }
-      ]
-    ]
-  };
-
-  return { text, reply_markup };
+  if (isAuthMode) {
+    return { ...base, bitchordAuth: true };
+  }
+  return base;
 }
 
 export default {
@@ -263,8 +127,6 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const origin = url.origin;
-    const limit = parseInt(env.DAILY_LIMIT || "250", 10);
-    const botToken = (env.TELEGRAM_BOT_TOKEN || "").trim();
 
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
@@ -276,525 +138,309 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // Webhook Setup Helper
-    if (path === "/setup-webhook") {
-      if (!botToken) {
-        return new Response(JSON.stringify({ error: "TELEGRAM_BOT_TOKEN is not configured" }), {
-          status: 400,
-          headers: { "Content-Type": "application/json", ...corsHeaders }
-        });
-      }
-      const webhookUrl = `${origin}/webhook`;
-      const tgRes = await sendTelegram(botToken, "setWebhook", { url: webhookUrl });
-      return new Response(JSON.stringify({ webhookUrl, telegram: tgRes }), {
+    const lastwaveUrl = (env.LASTWAVE_URL || DEFAULT_LASTWAVE_URL).replace(/\/+$/, "");
+    const lastwaveSecret = env.LASTWAVE_SECRET || DEFAULT_LASTWAVE_SECRET;
+    const bridgeUrl = (env.UPSTREAM_BRIDGE_URL || DEFAULT_BRIDGE_URL).replace(/\/+$/, "");
+    const qobuzUrl = (env.UPSTREAM_QOBUZ_URL || "").replace(/\/+$/, "");
+
+    // Dual-Mode Routing:
+    // 1. Rooted mode (default): /manifest.json, /search, /stream/:id
+    // 2. Auth mode (OnePlus 13 / unrooted): /auth, /auth/manifest.json, /auth/search, /auth/stream/:id
+    let normalizedSubPath = path;
+    const tokenMatch = path.match(/^\/u\/[a-zA-Z0-9_-]+(\/.*)?$/);
+    if (tokenMatch) {
+      normalizedSubPath = tokenMatch[1] || "";
+    } else if (path.startsWith("/sksalapur")) {
+      normalizedSubPath = path.slice("/sksalapur".length) || "";
+    }
+
+    let isAuthMode = false;
+    if (normalizedSubPath.startsWith("/auth")) {
+      isAuthMode = true;
+      normalizedSubPath = normalizedSubPath.slice("/auth".length) || "";
+    }
+
+    if (normalizedSubPath === "" || normalizedSubPath === "/") {
+      normalizedSubPath = "/manifest.json";
+    }
+
+    // 1. Manifest Endpoint
+    if (normalizedSubPath === "/manifest.json") {
+      return new Response(JSON.stringify(getManifest(isAuthMode)), {
         headers: { "Content-Type": "application/json", ...corsHeaders }
       });
     }
 
-    // Telegram Bot Webhook
-    if (path === "/webhook" && request.method === "POST") {
-      if (!botToken) {
-        return new Response("Bot token not set", { status: 500 });
-      }
+    // 2. Health Endpoint
+    if (normalizedSubPath === "/health") {
+      return new Response(JSON.stringify({ status: "ok", name: "Lossless Edge", version: "2.1.0", authMode: isAuthMode, engine: "parallel" }), {
+        headers: { "Content-Type": "application/json", ...corsHeaders }
+      });
+    }
 
-      try {
-        const raw = await request.text();
-        if (!raw.trim()) return new Response("OK");
-        let update: any;
-        try {
-          update = JSON.parse(raw);
-        } catch (e) {
-          console.error("JSON parse error:", e, "raw:", raw);
-          return new Response("OK");
+    // 2.5 BitChord Addon Auth Verification: ONLY enforced when isAuthMode is true
+    if (isAuthMode) {
+      const denied = await bitchordAuth.guard(request);
+      if (denied) {
+        const resHeaders = new Headers(denied.headers);
+        for (const [k, v] of Object.entries(corsHeaders)) {
+          resHeaders.set(k, v);
         }
-
-        if (update.message) {
-          const msg = update.message;
-          const chatId = msg.chat?.id;
-          const text = (msg.text || "").trim();
-          const from = msg.from;
-
-          if (!chatId || !from) {
-            return new Response("OK");
-          }
-
-          // Strict chat-type guard: ignore any messages from groups/channels
-          if (msg.chat?.type && msg.chat.type !== "private") {
-            return new Response("OK");
-          }
-
-          if (text === "/start" || text.startsWith("/start ") || text === "/login") {
-            let user = await getUserByTelegramId(env, from.id);
-            if (!user) {
-              const token = generateSecureToken();
-              user = {
-                telegram_id: from.id,
-                username: from.username || "",
-                first_name: from.first_name || "",
-                token,
-                created_at: Date.now()
-              };
-              await saveUser(env, user);
-            }
-
-            const addonUrl = `${origin}/u/${user.token}`;
-            const { text: msgText, reply_markup } = makeStartMessage(addonUrl, limit);
-            await sendTelegram(botToken, "sendMessage", {
-              chat_id: chatId,
-              text: msgText,
-              parse_mode: "Markdown",
-              reply_markup
-            });
-            return new Response("OK");
-          }
-
-          if (text === "/quota" || text === "/status") {
-            let user = await getUserByTelegramId(env, from.id);
-            if (!user) {
-              await sendTelegram(botToken, "sendMessage", {
-                chat_id: chatId,
-                text: "⚠️ You are not registered yet. Please send /start to get your private Addon URL.",
-                parse_mode: "Markdown"
-              });
-              return new Response("OK");
-            }
-
-            const today = getTodayUTC();
-            const used = await getStreamCount(env, user.token, today);
-            const addonUrl = `${origin}/u/${user.token}`;
-            const { text: msgText, reply_markup } = makeQuotaMessage(used, limit, addonUrl);
-            await sendTelegram(botToken, "sendMessage", {
-              chat_id: chatId,
-              text: msgText,
-              parse_mode: "Markdown",
-              reply_markup
-            });
-            return new Response("OK");
-          }
-
-          if (text === "/reset" || text === "/regenerate") {
-            const newToken = generateSecureToken();
-            const user: UserRecord = {
-              telegram_id: from.id,
-              username: from.username || "",
-              first_name: from.first_name || "",
-              token: newToken,
-              created_at: Date.now()
-            };
-            await saveUser(env, user);
-
-            const newUrl = `${origin}/u/${newToken}`;
-            await sendTelegram(botToken, "sendMessage", {
-              chat_id: chatId,
-              text: 
-`🔄 *Your Addon URL Has Been Regenerated!*
-
-Your previous URL is now revoked. Here is your new private URL:
-
-\`${newUrl}\`
-_(Tap to copy)_
-
-Please update this URL in **Timbre** ➔ **Settings** ➔ **Sources**.`,
-              parse_mode: "Markdown",
-              reply_markup: {
-                inline_keyboard: [
-                  [{ text: "📊 Check Usage / Quota", callback_data: "check_quota" }]
-                ]
-              }
-            });
-            return new Response("OK");
-          }
-
-          if (text === "/help") {
-            await sendTelegram(botToken, "sendMessage", {
-              chat_id: chatId,
-              text:
-`📖 *Timbre Lossless Bot Commands:*
-
-• /start — Get your private Addon URL and setup instructions
-• /quota — View today's stream consumption and remaining songs
-• /reset — Revoke your token and generate a new private URL
-• /help — Show this help message
-
-For full setup documentation, visit https://sksalapur.github.io/Timbre/`,
-              parse_mode: "Markdown"
-            });
-            return new Response("OK");
-          }
-        }
-
-        if (update.callback_query) {
-          const cb = update.callback_query;
-          const chatId = cb.message?.chat?.id;
-          const messageId = cb.message?.message_id;
-          const from = cb.from;
-          const data = cb.data;
-
-          if (chatId && from) {
-            let user = await getUserByTelegramId(env, from.id);
-            if (!user) {
-              await sendTelegram(botToken, "answerCallbackQuery", {
-                callback_query_id: cb.id,
-                text: "Please send /start first!",
-                show_alert: true
-              });
-              return new Response("OK");
-            }
-
-            if (data === "check_quota") {
-              const today = getTodayUTC();
-              const used = await getStreamCount(env, user.token, today);
-              const addonUrl = `${origin}/u/${user.token}`;
-              const { text: msgText, reply_markup } = makeQuotaMessage(used, limit, addonUrl);
-              
-              if (messageId) {
-                await sendTelegram(botToken, "editMessageText", {
-                  chat_id: chatId,
-                  message_id: messageId,
-                  text: msgText,
-                  parse_mode: "Markdown",
-                  reply_markup
-                });
-              }
-              await sendTelegram(botToken, "answerCallbackQuery", {
-                callback_query_id: cb.id,
-                text: `Streams used today: ${used}/${limit}`
-              });
-              return new Response("OK");
-            }
-
-            if (data === "get_url") {
-              const addonUrl = `${origin}/u/${user.token}`;
-              await sendTelegram(botToken, "answerCallbackQuery", {
-                callback_query_id: cb.id
-              });
-              await sendTelegram(botToken, "sendMessage", {
-                chat_id: chatId,
-                text: `🔗 *Your Private Addon URL:*\n\n\`${addonUrl}\`\n\n_(Tap to copy)_`,
-                parse_mode: "Markdown"
-              });
-              return new Response("OK");
-            }
-
-            if (data === "reset_url") {
-              const newToken = generateSecureToken();
-              user = {
-                ...user,
-                token: newToken
-              };
-              await saveUser(env, user);
-              const newUrl = `${origin}/u/${newToken}`;
-
-              await sendTelegram(botToken, "answerCallbackQuery", {
-                callback_query_id: cb.id,
-                text: "New URL generated!"
-              });
-              await sendTelegram(botToken, "sendMessage", {
-                chat_id: chatId,
-                text:
-`🔄 *Addon URL Regenerated!*
-
-New Private URL:
-\`${newUrl}\`
-_(Tap to copy)_
-
-Make sure to replace this in Timbre ➔ Settings ➔ Sources.`,
-                parse_mode: "Markdown"
-              });
-              return new Response("OK");
-            }
-          }
-        }
-
-        return new Response("OK");
-      } catch (err: any) {
-        console.error("Webhook error:", err);
-        return new Response(`Internal error: ${err?.message || err}\nStack: ${err?.stack || ''}`, { status: 500 });
+        return new Response(denied.body, { status: denied.status, headers: resHeaders });
       }
     }
 
-    // Timbre Addon Endpoints
-    const userMatch = path.match(/^\/u\/([a-zA-Z0-9_-]+)(\/.*)?$/);
-    if (userMatch) {
-      const token = userMatch[1];
-      const subPath = userMatch[2] || "";
-
-      // Ultra-Fast Path for Manifest & Health Checks (<5ms edge response, zero D1 roundtrip)
-      if (subPath === "/manifest.json" || subPath === "") {
-        if (!token || token.length < 16) {
-          return new Response(JSON.stringify({ error: "Unauthorized: Invalid token format" }), {
-            status: 401,
-            headers: { "Content-Type": "application/json", ...corsHeaders }
-          });
-        }
-        const manifest = {
-          id: "timbre-lossless",
-          name: "Timbre Cloudflare Edge (FLAC)",
-          version: "1.8-2",
-          description: "Studio Hi-Res Lossless 24-bit FLAC streams for Timbre",
-          resources: ["search", "stream"],
-          settings: [
-            {
-              key: "quality",
-              default: "LOSSLESS",
-              options: [
-                { value: "LOSSLESS" },
-                { value: "HIGH" },
-                { value: "LOW" }
-              ]
-            }
-          ],
-          allowDownloads: true,
-          checkValidLossless: false
-        };
-        return new Response(JSON.stringify(manifest), {
+    // 3. Parallel Search Endpoint
+    if (normalizedSubPath.startsWith("/search")) {
+      const rawQuery = url.searchParams.get("q") || "";
+      if (!rawQuery.trim()) {
+        return new Response(JSON.stringify({ tracks: [] }), {
           headers: { "Content-Type": "application/json", ...corsHeaders }
         });
       }
 
-      // Authenticate user for search and stream endpoints
-      const user = await getUserByToken(env, token);
-      if (!user) {
-        return new Response(JSON.stringify({ error: "Unauthorized: Invalid or revoked private token" }), {
-          status: 401,
+      const cacheKey = rawQuery.trim().toLowerCase();
+      const cached = searchCache.get(cacheKey);
+      if (cached && (Date.now() - cached.cachedAt < SEARCH_CACHE_TTL)) {
+        return new Response(JSON.stringify({ tracks: cached.data }), {
           headers: { "Content-Type": "application/json", ...corsHeaders }
         });
       }
 
-      // Search (with in-memory cache and cleanQuery title normalization)
-      if (subPath.startsWith("/search")) {
-        const query = url.searchParams.get("q") || "";
-        if (!query.trim()) {
-          return new Response(JSON.stringify({ tracks: [] }), {
-            headers: { "Content-Type": "application/json", ...corsHeaders }
-          });
-        }
+      const cleaned = cleanQuery(rawQuery);
 
-        const cacheKey = query.trim().toLowerCase();
-        const cachedSearch = searchCache.get(cacheKey);
-        if (cachedSearch && (Date.now() - cachedSearch.cachedAt < SEARCH_CACHE_TTL)) {
-          return new Response(JSON.stringify({ tracks: cachedSearch.data }), {
-            headers: { "Content-Type": "application/json", ...corsHeaders }
-          });
-        }
-
-        const cleaned = cleanQuery(query);
-        const upstreamSearch = env.UPSTREAM_SEARCH_URL || "https://qobuz-dll.foreyou.workers.dev/api/get-music";
-
-        const trySearch = async (searchTerm: string): Promise<any[]> => {
-          try {
-            const searchReq = await fetch(`${upstreamSearch}?q=${encodeURIComponent(searchTerm)}&offset=0`, {
-              headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
-            });
-            if (!searchReq.ok) return [];
-            const searchData = await searchReq.json<any>();
-            const items = searchData?.data?.tracks?.items || [];
-            return items.map((item: any) => ({
-              id: String(item.id),
-              title: item.title || "",
-              artist: item.performer?.name || "",
-              album: item.album?.title || "",
-              duration: item.duration || 0,
-              artworkURL: item.album?.image?.large || item.album?.image?.small || "",
-              format: "flac",
-              audioQuality: "LOSSLESS"
-            }));
-          } catch (err) {
-            console.error(`Search error for '${searchTerm}':`, err);
-            return [];
-          }
-        };
-
-        // 1. Try cleaned query first
-        let tracks = await trySearch(cleaned);
-
-        // 2. Fallback to raw query if cleaned had 0 results
-        if (tracks.length === 0 && cleaned !== query) {
-          tracks = await trySearch(query);
-        }
-
-        // 3. Fallback to UPSTREAM_BRIDGE_URL if configured and Vercel/Qobuz failed
-        if (tracks.length === 0 && env.UPSTREAM_BRIDGE_URL) {
-          try {
-            const bridgeUrl = `${env.UPSTREAM_BRIDGE_URL.replace(/\/+$/, "")}/search?q=${encodeURIComponent(cleaned)}`;
-            const bReq = await fetch(bridgeUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
-            if (bReq.ok) {
-              const bData = await bReq.json<any>();
-              if (Array.isArray(bData?.tracks)) {
-                tracks = bData.tracks;
-              }
-            }
-          } catch (bErr) {
-            console.error("Bridge search fallback error:", bErr);
-          }
-        }
-
-        searchCache.set(cacheKey, { data: tracks, cachedAt: Date.now() });
-
-        return new Response(JSON.stringify({ tracks }), {
-          headers: { "Content-Type": "application/json", ...corsHeaders }
-        });
-      }
-
-      // Stream (with in-memory cache and bridge fallback)
-      const streamMatch = subPath.match(/^\/stream\/(.+)$/);
-      if (streamMatch) {
-        const trackId = streamMatch[1];
-        const today = getTodayUTC();
-
-        const currentCount = await getStreamCount(env, token, today);
-        if (currentCount >= limit) {
-          return new Response(JSON.stringify({
-            error: `Daily limit of ${limit} songs reached. Quota resets at 00:00 UTC. Check @${env.BOT_USERNAME || "Timbre_Lossless_Bot"} for status.`
-          }), {
-            status: 429,
-            headers: { "Content-Type": "application/json", ...corsHeaders }
-          });
-        }
-
-        const cachedStream = streamCache.get(trackId);
-        if (cachedStream && (Date.now() - cachedStream.cachedAt < STREAM_CACHE_TTL)) {
-          return new Response(JSON.stringify(cachedStream.data), {
-            headers: { "Content-Type": "application/json", ...corsHeaders }
-          });
-        }
-
-        await incrementStreamCount(env, token, today);
-
-        const upstreamDownload = env.UPSTREAM_DOWNLOAD_URL || "https://qobuz-dll.foreyou.workers.dev/api/download-music";
+      // Provider 1: LastWave Native Edge Search
+      const searchLastWave = async (term: string): Promise<any[]> => {
         try {
-          const dlReq = await fetch(`${upstreamDownload}?track_id=${encodeURIComponent(trackId)}&quality=27`, {
-            headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+          const targetUrl = `${lastwaveUrl}/search?q=${encodeURIComponent(term)}&quality=27`;
+          const headers = await getSignedLastWaveHeaders(targetUrl, "GET", lastwaveSecret);
+          const resp = await fetch(targetUrl, { 
+            headers,
+            signal: AbortSignal.timeout(6000)
           });
-          const dlData = await dlReq.json<any>();
-          const data = dlData?.data;
-
-          if (data?.url) {
-            const responseStream = {
-              url: data.url,
-              format: "flac",
-              quality: "LOSSLESS",
-              bitDepth: data.bit_depth || 24,
-              sampleRate: data.sampling_rate ? data.sampling_rate * 1000 : 96000,
-              codec: "flac"
-            };
-            streamCache.set(trackId, { data: responseStream, cachedAt: Date.now() });
-            return new Response(JSON.stringify(responseStream), {
-              headers: { "Content-Type": "application/json", ...corsHeaders }
-            });
-          }
-        } catch (err: any) {
-          console.error("Primary stream resolution error:", err);
+          if (!resp.ok) return [];
+          const data = await resp.json<any>();
+          const rawTracks = data?.tracks || [];
+          return rawTracks.map((t: any) => ({
+            id: String(t.id),
+            title: t.title || "",
+            artist: t.artist || t.performerName || "",
+            album: t.album || t.albumTitle || "",
+            duration: t.duration || 0,
+            artworkURL: t.artworkURL || t.cover || "",
+            format: "flac",
+            audioQuality: "LOSSLESS",
+            quality: t.quality || "Hi-Res Lossless",
+            bitDepth: t.bitDepth || 24,
+            sampleRate: t.sampleRate || 192000,
+            _source: "lastwave"
+          }));
+        } catch (err) {
+          return [];
         }
+      };
 
-        // Fallback to UPSTREAM_BRIDGE_URL if configured
-        if (env.UPSTREAM_BRIDGE_URL) {
-          try {
-            const bridgeStreamUrl = `${env.UPSTREAM_BRIDGE_URL.replace(/\/+$/, "")}/stream/${encodeURIComponent(trackId)}`;
-            const bReq = await fetch(bridgeStreamUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
-            if (bReq.ok) {
-              const bData = await bReq.json<any>();
-              if (bData?.url) {
-                streamCache.set(trackId, { data: bData, cachedAt: Date.now() });
-                return new Response(JSON.stringify(bData), {
-                  headers: { "Content-Type": "application/json", ...corsHeaders }
-                });
-              }
-            }
-          } catch (bErr) {
-            console.error("Bridge stream fallback error:", bErr);
-          }
+      // Provider 2: Parallel Bridge Resolver (Fly.io)
+      const searchBridge = async (term: string): Promise<any[]> => {
+        if (!bridgeUrl) return [];
+        try {
+          const targetUrl = `${bridgeUrl}/search?q=${encodeURIComponent(term)}`;
+          const resp = await fetch(targetUrl, {
+            headers: { "User-Agent": "Mozilla/5.0 LosslessEdge/2.0" },
+            signal: AbortSignal.timeout(6000)
+          });
+          if (!resp.ok) return [];
+          const data = await resp.json<any>();
+          const tracks = Array.isArray(data?.tracks) ? data.tracks : [];
+          return tracks.map((t: any) => ({ ...t, _source: "bridge" }));
+        } catch (err) {
+          return [];
         }
+      };
 
-        return new Response(JSON.stringify({ error: "Stream not available from lossless provider" }), {
-          status: 404,
-          headers: { "Content-Type": "application/json", ...corsHeaders }
-        });
+      // Provider 3: Optional Direct Qobuz Scraper (if configured and active)
+      const searchQobuz = async (term: string): Promise<any[]> => {
+        if (!qobuzUrl) return [];
+        try {
+          const targetUrl = `${qobuzUrl}/api/get-music?q=${encodeURIComponent(term)}&offset=0`;
+          const resp = await fetch(targetUrl, {
+            headers: { "User-Agent": "Mozilla/5.0 LosslessEdge/2.0" },
+            signal: AbortSignal.timeout(5000)
+          });
+          if (!resp.ok) return [];
+          const data = await resp.json<any>();
+          const items = data?.data?.tracks?.items || [];
+          return items.map((t: any) => ({
+            id: `qobuz_${t.id}`,
+            title: t.title || "",
+            artist: t.performer?.name || "",
+            album: t.album?.title || "",
+            duration: t.duration || 0,
+            artworkURL: t.album?.image?.large || t.album?.image?.small || "",
+            format: "flac",
+            audioQuality: "LOSSLESS",
+            quality: "Lossless",
+            bitDepth: t.maximum_bit_depth || 16,
+            sampleRate: t.maximum_sampling_rate ? Math.round(t.maximum_sampling_rate * 1000) : 44100,
+            _source: "qobuz"
+          }));
+        } catch (err) {
+          return [];
+        }
+      };
+
+      // Parallel Execution across all active providers via Promise.allSettled
+      const [lwRes, bridgeRes, qobuzRes] = await Promise.allSettled([
+        searchLastWave(cleaned),
+        searchBridge(cleaned),
+        searchQobuz(cleaned)
+      ]);
+
+      let allTracks: any[] = [];
+      if (lwRes.status === "fulfilled") allTracks.push(...lwRes.value);
+      if (bridgeRes.status === "fulfilled") allTracks.push(...bridgeRes.value);
+      if (qobuzRes.status === "fulfilled") allTracks.push(...qobuzRes.value);
+
+      // Fallback search with raw query if cleaned returned 0 results
+      if (allTracks.length === 0 && cleaned !== rawQuery) {
+        const [lwRaw, bridgeRaw] = await Promise.allSettled([
+          searchLastWave(rawQuery),
+          searchBridge(rawQuery)
+        ]);
+        if (lwRaw.status === "fulfilled") allTracks.push(...lwRaw.value);
+        if (bridgeRaw.status === "fulfilled") allTracks.push(...bridgeRaw.value);
       }
+
+      // De-duplicate tracks by normalized ID and title+artist
+      const seenIds = new Set<string>();
+      const seenTitles = new Set<string>();
+      const deduped: any[] = [];
+
+      for (const t of allTracks) {
+        const idKey = String(t.id);
+        const titleKey = `${(t.title || "").toLowerCase().trim()}|${(t.artist || "").toLowerCase().trim()}`;
+        if (!seenIds.has(idKey) && !seenTitles.has(titleKey)) {
+          seenIds.add(idKey);
+          seenTitles.add(titleKey);
+          deduped.push(t);
+        }
+      }
+
+      // Quality scoring rank: 24-bit 192kHz/96kHz Hi-Res FLAC ranks first
+      deduped.sort((a, b) => qualityScore(b) - qualityScore(a));
+
+      searchCache.set(cacheKey, { data: deduped, cachedAt: Date.now() });
+      return new Response(JSON.stringify({ tracks: deduped }), {
+        headers: { "Content-Type": "application/json", ...corsHeaders }
+      });
     }
 
-    // Landing Page
-    if (path === "/" || path === "/health") {
-      const botName = env.BOT_USERNAME || "Timbre_Lossless_Bot";
-      const html = `<!DOCTYPE html>
+    // 4. Parallel Stream Resolution Endpoint
+    const streamMatch = normalizedSubPath.match(/^\/stream\/(.+)$/);
+    if (streamMatch) {
+      const trackId = streamMatch[1];
+      const cachedStream = streamCache.get(trackId);
+      if (cachedStream && (Date.now() - cachedStream.cachedAt < STREAM_CACHE_TTL)) {
+        return new Response(JSON.stringify(cachedStream.data), {
+          headers: { "Content-Type": "application/json", ...corsHeaders }
+        });
+      }
+
+      // Targeted resolution based on track origin
+      const isQobuz = trackId.startsWith("qobuz_");
+
+      // Try Primary: LastWave (or Qobuz if prefix matches)
+      if (!isQobuz) {
+        try {
+          const streamUrl = `${lastwaveUrl}/stream/${encodeURIComponent(trackId)}?quality=27`;
+          const headers = await getSignedLastWaveHeaders(streamUrl, "GET", lastwaveSecret);
+          const resp = await fetch(streamUrl, { 
+            headers,
+            signal: AbortSignal.timeout(6000)
+          });
+          if (resp.ok) {
+            const data = await resp.json<any>();
+            if (data?.url) {
+              const responsePayload = {
+                url: data.url,
+                format: data.format || "dash",
+                codec: data.codec || "flac",
+                container: data.container || "mp4",
+                manifest: data.manifest || "dash",
+                encrypted: false,
+                quality: data.quality || "Hi-Res Lossless",
+                audioQuality: "LOSSLESS",
+                bitDepth: data.bitDepth || 24,
+                sampleRate: data.sampleRate || 192000,
+                bitrate: data.bitrate || 6022495
+              };
+              streamCache.set(trackId, { data: responsePayload, cachedAt: Date.now() });
+              return new Response(JSON.stringify(responsePayload), {
+                headers: { "Content-Type": "application/json", ...corsHeaders }
+              });
+            }
+          }
+        } catch (err) {
+          // Fall through to bridge
+        }
+      }
+
+      // Parallel Fallback: Query Parallel-Lossless-Edge (Fly.io)
+      if (bridgeUrl) {
+        try {
+          const bridgeStream = `${bridgeUrl}/stream/${encodeURIComponent(trackId)}`;
+          const bResp = await fetch(bridgeStream, { 
+            headers: { "User-Agent": "Mozilla/5.0 LosslessEdge/2.0" },
+            signal: AbortSignal.timeout(6000)
+          });
+          if (bResp.ok) {
+            const bData = await bResp.json<any>();
+            if (bData?.url) {
+              streamCache.set(trackId, { data: bData, cachedAt: Date.now() });
+              return new Response(JSON.stringify(bData), {
+                headers: { "Content-Type": "application/json", ...corsHeaders }
+              });
+            }
+          }
+        } catch (bErr) {
+          // Fall through to 404
+        }
+      }
+
+      return new Response(JSON.stringify({ error: "Stream unavailable from lossless provider" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json", ...corsHeaders }
+      });
+    }
+
+    // 5. Landing / Information Page
+    const personalUrl = `${origin}/sksalapur`;
+    const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Timbre Lossless FLAC Resolver</title>
+  <title>Lossless Edge</title>
   <style>
-    body {
-      background: #0d1117;
-      color: #c9d1d9;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 100vh;
-      margin: 0;
-      padding: 20px;
-      box-sizing: border-box;
-    }
-    .card {
-      background: #161b22;
-      border: 1px solid #30363d;
-      border-radius: 12px;
-      padding: 32px;
-      max-width: 480px;
-      width: 100%;
-      text-align: center;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
-    }
-    h1 {
-      color: #58a6ff;
-      margin-top: 0;
-      font-size: 24px;
-    }
-    p {
-      line-height: 1.6;
-      color: #8b949e;
-    }
-    .badge {
-      display: inline-block;
-      padding: 4px 12px;
-      border-radius: 20px;
-      background: rgba(46, 160, 67, 0.2);
-      color: #3fb950;
-      font-size: 13px;
-      font-weight: 600;
-      margin-bottom: 20px;
-    }
-    .btn {
-      display: inline-block;
-      margin-top: 20px;
-      padding: 12px 24px;
-      border-radius: 8px;
-      background: #238636;
-      color: #ffffff;
-      text-decoration: none;
-      font-weight: 600;
-      transition: background 0.2s;
-    }
-    .btn:hover {
-      background: #2ea043;
-    }
+    body { background: #0b0f19; color: #e2e8f0; font-family: sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+    .card { background: #1e293b; padding: 32px; border-radius: 16px; border: 1px solid #334155; max-width: 500px; width: 90%; text-align: center; }
+    h1 { color: #38bdf8; margin: 12px 0; }
+    .url-box { background: #0f172a; padding: 12px; border-radius: 8px; font-family: monospace; word-break: break-all; color: #a5f3fc; border: 1px solid #1e293b; margin: 16px 0; }
+    .badge { display: inline-block; background: #0284c7; color: white; padding: 4px 12px; border-radius: 9999px; font-size: 12px; font-weight: bold; letter-spacing: 0.5px; }
   </style>
 </head>
 <body>
   <div class="card">
-    <div class="badge">● Operational</div>
-    <h1>Timbre Lossless FLAC Gateway</h1>
-    <p>This service provides high-resolution 24-bit FLAC audio streams for Timbre music player users.</p>
-    <p>Private authenticated addon endpoints are managed directly within Telegram — zero browser dashboard required.</p>
-    <a href="https://t.me/${botName}" class="btn" target="_blank">Open Telegram Bot (@${botName})</a>
+    <div class="badge">PARALLEL LOSSLESS ENGINE</div>
+    <h1>Lossless Edge</h1>
+    <p>High-Performance Multi-Resolver 24-bit 192kHz FLAC streaming for BitChord.</p>
+    <div class="url-box">${personalUrl}</div>
+    <p style="color: #94a3b8; font-size: 14px;">Add to BitChord &rarr; Settings &rarr; Sources &rarr; Add Custom Addon.</p>
   </div>
 </body>
 </html>`;
-      return new Response(html, {
-        headers: { "Content-Type": "text/html; charset=utf-8", ...corsHeaders }
-      });
-    }
 
-    return new Response("Not Found", { status: 404, headers: corsHeaders });
+    return new Response(html, {
+      headers: { "Content-Type": "text/html; charset=utf-8", ...corsHeaders }
+    });
   }
 };

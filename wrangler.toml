@@ -1,15 +1,9 @@
-﻿name = "timbre-lossless-worker"
+name = "timbre-lossless-worker"
 main = "src/index.ts"
 compatibility_date = "2024-04-01"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
-DAILY_LIMIT = "250"
-BOT_USERNAME = "Timbre_Lossless_Bot"
-UPSTREAM_SEARCH_URL = "https://qobuz-dll.foreyou.workers.dev/api/get-music"
-UPSTREAM_DOWNLOAD_URL = "https://qobuz-dll.foreyou.workers.dev/api/download-music"
-
-[[d1_databases]]
-binding = "DB"
-database_name = "timbre-db"
-database_id = "5975b26f-8b05-4ae8-950c-6ba46dc3eec9"
+UPSTREAM_BRIDGE_URL = "https://lossless-bridge.fly.dev/sksalapur"
+LASTWAVE_URL = "https://lastwaveaddons.clashprojects.qd.je/a/4577b43d1be84f289dc05c9f794a8e992f0a58b99b2db3a49096a77ea22c911e"
+LASTWAVE_SECRET = "36d96a751b12ee481c281a8a8e64c482d0c1634a22061ab72f40175017818b85"
