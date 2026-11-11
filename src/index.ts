@@ -100,7 +100,49 @@ function significantTokens(value: string): string[] {
     .filter(w => w.length >= 3);
 }
 
-function qualityScore(track: any): number {
+function normalizeQualityTier(raw?: string | null): "max" | "lossless" | "high" {
+  const val = (raw || "").trim().toLowerCase();
+  if (val === "lossless" || val === "cd") return "lossless";
+  if (val === "high" || val === "low") return "high";
+  return "max";
+}
+
+const UNREQUESTED_VARIANT_TERMS = [
+  "live",
+  "sad",
+  "remix",
+  "rework",
+  "acoustic",
+  "instrumental",
+  "karaoke",
+  "cover",
+  "tribute",
+  "slowed",
+  "reverb",
+  "sped up",
+  "nightcore",
+  "lofi",
+  "lo fi",
+  "unplugged",
+  "8d"
+];
+
+/** Penalize live/sad/remix/instrumental editions unless the listener asked for them. */
+function variantPenalty(query: string, title: string, album: string = ""): number {
+  const nq = normalizeText(query);
+  const nt = normalizeText(`${title} ${album}`);
+  if (!nt) return 0;
+  let penalty = 0;
+  for (const term of UNREQUESTED_VARIANT_TERMS) {
+    const rx = new RegExp(`(?:^|\\s)${term}(?:$|\\s)`);
+    if (rx.test(nt) && !rx.test(nq)) {
+      penalty += 6;
+    }
+  }
+  return penalty;
+}
+
+function qualityScore(track: any, preferredTier: "max" | "lossless" | "high" = "max"): number {
   let bitDepth = Number(track.bitDepth) || 0;
   let sampleRate = Number(track.sampleRate) || 0;
   if (!bitDepth) {
@@ -118,7 +160,11 @@ function qualityScore(track: any): number {
   }
   // Prefer direct native FLAC on equal resolution ties
   const directBonus = track._source === "monochrome" ? 1 : 0;
-  return (bitDepth * 1_000_000 + sampleRate) * 10 + directBonus;
+  const base = (bitDepth * 1_000_000 + sampleRate) * 10 + directBonus;
+  if (preferredTier === "lossless" && bitDepth <= 16 && sampleRate <= 48000) {
+    return 10_000_000_000 + base;
+  }
+  return base;
 }
 
 const PRANK_URL_PATTERNS = [
@@ -244,17 +290,25 @@ async function getSignedLastWaveHeaders(targetUrl: string, method: string, secre
   };
 }
 
+function isNegativeCachedUrl(streamUrl: string): boolean {
+  const exp = badUrlCache.get(streamUrl);
+  if (!exp) return false;
+  if (Date.now() < exp) return true;
+  badUrlCache.delete(streamUrl);
+  return false;
+}
+
 // Verify stream payload against actual upstream content before returning to BitChord so pranks/lossy MP4s never pass.
 async function verifyAndNormalizeStream(
   rawStream: any,
   lastwaveUrl: string,
   lastwaveSecret: string,
-  durationHintSec: number = 0
+  durationHintSec: number = 0,
+  timeoutMs: number = 6500
 ): Promise<any | null> {
   const streamUrl = rawStream?.url;
   if (isSuspectPrankUrl(streamUrl)) return null;
-  const badExp = badUrlCache.get(streamUrl);
-  if (badExp && Date.now() < badExp) return null;
+  if (isNegativeCachedUrl(streamUrl)) return null;
 
   let pathname = "";
   let hostname = "";
@@ -332,9 +386,18 @@ async function verifyAndNormalizeStream(
 
     const resp = await fetch(streamUrl, {
       headers,
-      signal: AbortSignal.timeout(5000)
+      signal: AbortSignal.timeout(timeoutMs)
     });
     if (!resp.ok || isSuspectPrankUrl(resp.url || streamUrl)) {
+      if (resp.status === 429 && hostname.endsWith("monochrome.st")) {
+        const ra = Number(resp.headers.get("Retry-After")) || 10;
+        monochromeRetryAfterSec = Math.max(1, Math.min(120, ra));
+        monochromeCooldownUntil = Date.now() + monochromeRetryAfterSec * 1000;
+      } else if (resp.status === 404 || resp.status === 410) {
+        setBounded(badUrlCache, streamUrl, Date.now() + 20_000);
+      } else if (isSuspectPrankUrl(resp.url || streamUrl)) {
+        setBounded(badUrlCache, streamUrl, Date.now() + BAD_URL_TTL_MS);
+      }
       await resp.body?.cancel();
       return null;
     }
@@ -345,7 +408,10 @@ async function verifyAndNormalizeStream(
 
     // 1. Native FLAC signature ("fLaC")
     if (head[0] === 0x66 && head[1] === 0x4c && head[2] === 0x61 && head[3] === 0x43) {
-      if (!passesDurationSizeSanity(totalBytes, durationHintSec)) return null;
+      if (!passesDurationSizeSanity(totalBytes, durationHintSec)) {
+        setBounded(badUrlCache, streamUrl, Date.now() + BAD_URL_TTL_MS);
+        return null;
+      }
 
       let sampleRate = Number(rawStream.sampleRate) || 44100;
       let bitDepth = Number(rawStream.bitDepth) || 16;
@@ -414,11 +480,15 @@ async function verifyAndNormalizeStream(
       };
     }
 
+    setBounded(badUrlCache, streamUrl, Date.now() + BAD_URL_TTL_MS);
     return null;
   } catch {
     return null;
   }
 }
+
+let monochromeRetryAfterSec = 0;
+let monochromeCooldownUntil = 0;
 
 async function searchMonochrome(term: string, limit: number = 10): Promise<any[]> {
   try {
@@ -427,10 +497,17 @@ async function searchMonochrome(term: string, limit: number = 10): Promise<any[]
 
     const targetUrl = `${MONOCHROME_TRACKS_URL}/search/tracks?q=${encodeURIComponent(cleaned)}&limit=${limit}`;
     const resp = await fetch(targetUrl, {
-      headers: { "User-Agent": "Mozilla/5.0 LosslessEdge/2.2", "Accept": "application/json" },
-      signal: AbortSignal.timeout(5500)
+      headers: { "User-Agent": "Mozilla/5.0 LosslessEdge/2.3", "Accept": "application/json" },
+      signal: AbortSignal.timeout(9500)
     });
+    if (resp.status === 429) {
+      const ra = Number(resp.headers.get("Retry-After")) || 15;
+      monochromeRetryAfterSec = Math.max(1, Math.min(120, ra));
+      monochromeCooldownUntil = Date.now() + monochromeRetryAfterSec * 1000;
+      return [];
+    }
     if (!resp.ok) return [];
+    monochromeCooldownUntil = 0;
 
     const data = await resp.json<any>();
     const rawTracks: any[] = Array.isArray(data?.tracks) ? data.tracks : [];
@@ -553,7 +630,8 @@ async function fetchTidalTrackMeta(tidalId: string): Promise<TrackMeta | null> {
 async function resolveViaMonochromeMeta(
   meta: TrackMeta,
   lastwaveUrl: string,
-  lastwaveSecret: string
+  lastwaveSecret: string,
+  preferredTier: "max" | "lossless" | "high" = "max"
 ): Promise<any | null> {
   const queries = [];
   if (meta.artist) queries.push(`${meta.title} ${meta.artist}`);
@@ -572,8 +650,12 @@ async function resolveViaMonochromeMeta(
     }
   }
 
+  const queryHint = `${meta.title} ${meta.artist}`.trim();
   const ranked = allCandidates
-    .map(c => ({ candidate: c, score: scoreMonoCandidate(c, meta) }))
+    .map(c => ({
+      candidate: c,
+      score: scoreMonoCandidate(c, meta) - variantPenalty(queryHint, c.title || "", c.album || "") * 10
+    }))
     .filter(x => x.score >= 60)
     .sort((a, b) => b.score - a.score)
     .slice(0, 4);
@@ -586,21 +668,25 @@ async function resolveViaMonochromeMeta(
         { url: `${MONOCHROME_TRACKS_URL}/track/${candidate._monoId}`, format: "flac" },
         lastwaveUrl,
         lastwaveSecret,
-        candidate.duration || meta.duration
+        candidate.duration || meta.duration,
+        6500
       )
     )
   );
-  for (const p of probes) {
-    if (p.status === "fulfilled" && p.value) return p.value;
-  }
-  return null;
+  const validStreams = probes
+    .filter((p): p is PromiseFulfilledResult<any> => p.status === "fulfilled" && Boolean(p.value))
+    .map(p => p.value);
+  if (validStreams.length === 0) return null;
+
+  validStreams.sort((a, b) => qualityScore({ ...b, _source: "monochrome" }, preferredTier) - qualityScore({ ...a, _source: "monochrome" }, preferredTier));
+  return validStreams[0];
 }
 
 function getManifest(isAuthMode: boolean = false) {
   const base = {
     id: isAuthMode ? "lossless-edge-auth" : "lossless-edge",
     name: isAuthMode ? "Lossless Edge (Auth)" : "Lossless Edge",
-    version: "2.2.0",
+    version: "2.3.0",
     description: "High-Performance Parallel Lossless FLAC & DASH Audio Source for BitChord",
     resources: ["search", "stream"],
     allowDownloads: 1,
@@ -610,11 +696,13 @@ function getManifest(isAuthMode: boolean = false) {
         key: "quality",
         type: "select",
         label: "Audio Quality",
-        default: "hires",
+        default: "max",
         options: [
-          { value: "hires", label: "Hi-Res Lossless (Up to 24-bit/192kHz FLAC)" },
-          { value: "lossless", label: "Lossless (16-bit/44.1kHz FLAC)" },
-          { value: "high", label: "High Quality (320 kbps AAC)" }
+          { value: "max", label: "Max (best available)" },
+          { value: "hires", label: "Hi-Res (24-bit / up to 192 kHz FLAC)" },
+          { value: "lossless", label: "CD (16-bit / 44.1 kHz FLAC)" },
+          { value: "high", label: "High (Best available audio)" },
+          { value: "low", label: "Low (Data saver when available)" }
         ]
       }
     ]
@@ -657,6 +745,21 @@ export default {
       "Access-Control-Allow-Headers": "*",
     };
 
+    const jsonResponse = (
+      payload: unknown,
+      status: number = 200,
+      extraHeaders: Record<string, string> = {}
+    ): Response =>
+      new Response(JSON.stringify(payload), {
+        status,
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+          ...corsHeaders,
+          ...extraHeaders
+        }
+      });
+
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders });
     }
@@ -693,23 +796,19 @@ export default {
 
     // 1. Manifest Endpoint
     if (normalizedSubPath === "/manifest.json") {
-      return new Response(JSON.stringify(getManifest(isAuthMode)), {
-        headers: { "Content-Type": "application/json", ...corsHeaders }
-      });
+      return jsonResponse(getManifest(isAuthMode));
     }
 
     // 2. Health Endpoint
     if (normalizedSubPath === "/health") {
-      return new Response(JSON.stringify({
+      return jsonResponse({
         status: "ok",
         name: "Lossless Edge",
-        version: "2.2.0",
+        version: "2.3.0",
         authMode: isAuthMode,
         engine: "parallel",
         resolvers: Array.from(enabledResolvers),
         lastwaveCooldownActive: useLastWave && Date.now() < lastwaveCooldownUntil
-      }), {
-        headers: { "Content-Type": "application/json", ...corsHeaders }
       });
     }
 
@@ -729,19 +828,16 @@ export default {
     if (normalizedSubPath.startsWith("/search")) {
       const rawQuery = url.searchParams.get("q") || "";
       if (!rawQuery.trim()) {
-        return new Response(JSON.stringify({ tracks: [] }), {
-          headers: { "Content-Type": "application/json", ...corsHeaders }
-        });
+        return jsonResponse({ tracks: [] });
       }
 
+      const qualityTier = normalizeQualityTier(url.searchParams.get("quality"));
       const lwCoolingDown = useLastWave && Date.now() < lastwaveCooldownUntil;
       const priorityKey = Array.from(enabledResolvers).join(",");
-      const cacheKey = `${rawQuery.trim().toLowerCase()}|p:${priorityKey}|lw:${lwCoolingDown ? 0 : 1}`;
+      const cacheKey = `${rawQuery.trim().toLowerCase()}|p:${priorityKey}|lw:${lwCoolingDown ? 0 : 1}|q:${qualityTier}`;
       const cached = searchCache.get(cacheKey);
       if (cached && (Date.now() - cached.cachedAt < SEARCH_CACHE_TTL)) {
-        return new Response(JSON.stringify({ tracks: cached.data }), {
-          headers: { "Content-Type": "application/json", ...corsHeaders }
-        });
+        return jsonResponse({ tracks: cached.data });
       }
 
       const cleaned = cleanQuery(rawQuery);
@@ -842,17 +938,35 @@ export default {
       }
 
       const qTokens = significantTokens(cleaned);
+      const normCleaned = normalizeText(cleaned);
       const searchRelBucket = (t: any): number => {
         if (!qTokens.length) return 0;
-        const hay = normalizeText(`${t.title || ""} ${t.artist || ""}`);
+        const tTitle = t.title || "";
+        const tArtist = t.artist || "";
+        const normTitle = normalizeText(tTitle);
+        const hay = `${normTitle} ${normalizeText(tArtist)}`.trim();
         const hits = qTokens.filter(tok => hay.includes(tok)).length;
-        const exactTitleBonus = normalizeText(t.title || "") && normalizeText(cleaned).includes(normalizeText(t.title || "")) ? 2 : 0;
-        return hits * 2 + exactTitleBonus;
+        const exactTitleBonus =
+          normTitle && normTitle === normCleaned
+            ? 3
+            : normTitle && normCleaned.includes(normTitle)
+              ? 2
+              : 0;
+        const primaryArtist = tArtist.split(/,|&|\b(?:feat|featuring|ft)\.?\b/i)[0] || "";
+        const primaryTokens = significantTokens(primaryArtist);
+        const primaryMatchBonus = primaryTokens.some(tok => qTokens.includes(tok)) ? 2 : 0;
+        const unrequestedFeatPenalty =
+          /\b(?:feat|featuring|ft)\.?\b/i.test(tTitle) &&
+          !/\b(?:feat|featuring|ft)\.?\b/i.test(cleaned) &&
+          primaryMatchBonus === 0
+            ? 3
+            : 0;
+        return hits * 2 + exactTitleBonus + primaryMatchBonus - unrequestedFeatPenalty - variantPenalty(rawQuery, tTitle, t.album || "");
       };
       monoTracks.sort((a, b) => searchRelBucket(b) - searchRelBucket(a));
 
-      // Concurrently pre-verify top 4 relevant Monochrome hits so AAC-only entries are dropped
-      // before BitChord picks #1 and valid FLAC hits warm streamCache for instant /stream.
+      // Concurrently pre-verify top 4 relevant Monochrome hits so confirmed AAC/404 entries are dropped
+      // before BitChord picks #1 and valid FLAC hits warm streamCache; transient timeouts never prune tracks.
       const badMonoIds = new Set<string>();
       const topMonoToVerify = monoTracks.slice(0, 4);
       if (topMonoToVerify.length > 0) {
@@ -862,7 +976,8 @@ export default {
               { url: `${MONOCHROME_TRACKS_URL}/track/${m._monoId}`, format: "flac" },
               lastwaveUrl,
               lastwaveSecret,
-              m.duration || 0
+              m.duration || 0,
+              6000
             )
           )
         );
@@ -875,7 +990,7 @@ export default {
             m.quality = res.value.quality || m.quality;
             m._verifiedFlac = true;
             setBounded(streamCache, m.id, { data: res.value, cachedAt: Date.now() });
-          } else {
+          } else if (isNegativeCachedUrl(`${MONOCHROME_TRACKS_URL}/track/${m._monoId}`)) {
             badMonoIds.add(String(m._monoId));
           }
         }
@@ -916,7 +1031,7 @@ export default {
       const seenTitles = new Set<string>();
       const deduped: any[] = [];
 
-      // Sort: verified Monochrome FLAC first, then query token relevance, then quality tier
+      // Sort: verified Monochrome FLAC first, then query token relevance, then requested quality tier
       rawCombined.sort((a, b) => {
         const va = a._verifiedFlac ? 1 : 0;
         const vb = b._verifiedFlac ? 1 : 0;
@@ -924,7 +1039,7 @@ export default {
         const ra = searchRelBucket(a);
         const rb = searchRelBucket(b);
         if (ra !== rb) return rb - ra;
-        return qualityScore(b) - qualityScore(a);
+        return qualityScore(b, qualityTier) - qualityScore(a, qualityTier);
       });
 
       for (const t of rawCombined) {
@@ -940,10 +1055,18 @@ export default {
         }
       }
 
-      setBounded(searchCache, cacheKey, { data: deduped, cachedAt: Date.now() });
-      return new Response(JSON.stringify({ tracks: deduped }), {
-        headers: { "Content-Type": "application/json", ...corsHeaders }
-      });
+      if (deduped.length === 0 && Date.now() < monochromeCooldownUntil && monochromeRetryAfterSec > 0) {
+        return jsonResponse(
+          { error: "Upstream catalog temporarily rate limited", tracks: [] },
+          429,
+          { "Retry-After": String(monochromeRetryAfterSec) }
+        );
+      }
+
+      if (deduped.length > 0) {
+        setBounded(searchCache, cacheKey, { data: deduped, cachedAt: Date.now() });
+      }
+      return jsonResponse({ tracks: deduped });
     }
 
     // 4. Parallel Stream Resolution Endpoint
@@ -956,29 +1079,42 @@ export default {
         // Keep raw if malformed percent encoding
       }
 
-      const cachedStream = streamCache.get(rawTrackId);
+      const qualityParam = (url.searchParams.get("quality") || "").toLowerCase();
+      const qualityTier = normalizeQualityTier(qualityParam);
+      const streamCacheKey = `${rawTrackId}|q:${qualityTier}`;
+      const cachedStream = streamCache.get(streamCacheKey) || streamCache.get(rawTrackId);
       if (cachedStream && (Date.now() - cachedStream.cachedAt < STREAM_CACHE_TTL)) {
         if (!isSuspectPrankUrl(cachedStream.data?.url)) {
-          return new Response(JSON.stringify(cachedStream.data), {
-            headers: { "Content-Type": "application/json", ...corsHeaders }
-          });
+          return jsonResponse(cachedStream.data);
         }
+        streamCache.delete(streamCacheKey);
         streamCache.delete(rawTrackId);
       }
 
-      const qualityParam = (url.searchParams.get("quality") || "").toLowerCase();
       const [baseId, embeddedMonoId] = rawTrackId.split("~m");
       const meta = trackMetaCache.get(rawTrackId) || trackMetaCache.get(baseId);
       const durationHintSec = meta?.duration || 0;
 
-      // Helper: try Monochrome direct FLAC by known snowflake ID
+      // Helper: try Monochrome direct FLAC by known snowflake ID (with 1 quick retry on transient CDN drop)
       const tryMonoDirect = async (monoId: string): Promise<any | null> => {
         if (!monoId) return null;
-        return verifyAndNormalizeStream(
-          { url: `${MONOCHROME_TRACKS_URL}/track/${encodeURIComponent(monoId)}`, format: "flac" },
+        const monoUrl = `${MONOCHROME_TRACKS_URL}/track/${encodeURIComponent(monoId)}`;
+        const first = await verifyAndNormalizeStream(
+          { url: monoUrl, format: "flac" },
           lastwaveUrl,
           lastwaveSecret,
-          durationHintSec
+          durationHintSec,
+          7000
+        );
+        if (first) return first;
+        const badExp = badUrlCache.get(monoUrl);
+        if (badExp && Date.now() < badExp) return null;
+        return verifyAndNormalizeStream(
+          { url: monoUrl, format: "flac" },
+          lastwaveUrl,
+          lastwaveSecret,
+          durationHintSec,
+          5000
         );
       };
 
@@ -1041,14 +1177,14 @@ export default {
         const monoId = baseId.slice("mono_".length);
         resolved = await tryMonoDirect(monoId);
         if (!resolved && meta) {
-          resolved = await resolveViaMonochromeMeta(meta, lastwaveUrl, lastwaveSecret);
+          resolved = await resolveViaMonochromeMeta(meta, lastwaveUrl, lastwaveSecret, qualityTier);
         }
       } else if (baseId.startsWith("qobuz_")) {
         if (useQobuz) {
           resolved = await tryBridge(baseId);
         }
         if (!resolved && meta) {
-          resolved = await resolveViaMonochromeMeta(meta, lastwaveUrl, lastwaveSecret);
+          resolved = await resolveViaMonochromeMeta(meta, lastwaveUrl, lastwaveSecret, qualityTier);
         }
       } else {
         // Tidal / LastWave ID (possibly paired with ~m<monoId>)
@@ -1064,7 +1200,7 @@ export default {
           const resolvedMeta = meta || (await tidalMetaPromise);
           if (resolvedMeta) {
             setBounded(trackMetaCache, baseId, resolvedMeta);
-            resolved = await resolveViaMonochromeMeta(resolvedMeta, lastwaveUrl, lastwaveSecret);
+            resolved = await resolveViaMonochromeMeta(resolvedMeta, lastwaveUrl, lastwaveSecret, qualityTier);
           }
         }
         if (useLastWave && !resolved && preferDirect) {
@@ -1076,16 +1212,19 @@ export default {
       }
 
       if (resolved) {
-        setBounded(streamCache, rawTrackId, { data: resolved, cachedAt: Date.now() });
-        return new Response(JSON.stringify(resolved), {
-          headers: { "Content-Type": "application/json", ...corsHeaders }
-        });
+        setBounded(streamCache, streamCacheKey, { data: resolved, cachedAt: Date.now() });
+        return jsonResponse(resolved);
       }
 
-      return new Response(JSON.stringify({ error: "Stream unavailable from lossless provider" }), {
-        status: 404,
-        headers: { "Content-Type": "application/json", ...corsHeaders }
-      });
+      if (Date.now() < monochromeCooldownUntil && monochromeRetryAfterSec > 0) {
+        return jsonResponse(
+          { error: "Upstream catalog temporarily rate limited" },
+          429,
+          { "Retry-After": String(monochromeRetryAfterSec) }
+        );
+      }
+
+      return jsonResponse({ error: "Stream unavailable from lossless provider" }, 404);
     }
 
     // 5. Landing / Information Page
