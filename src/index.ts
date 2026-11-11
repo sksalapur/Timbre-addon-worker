@@ -16,7 +16,21 @@ const DEFAULT_LASTWAVE_SECRET = "36d96a751b12ee481c281a8a8e64c482d0c1634a22061ab
 const DEFAULT_BRIDGE_URL = "https://lossless-bridge.fly.dev/sksalapur";
 const MONOCHROME_TRACKS_URL = "https://tracks.monochrome.st";
 const TIDAL_WEB_TOKEN = "txNoH4kkV41MfH25";
+const DEFAULT_RESOLVER_PRIORITY = "monochrome"; // Optional disabled resolvers: lastwave,qobuz
 const DEFAULT_HOSTS = ["timbre-lossless-worker.sksalapur.workers.dev"];
+
+function parseResolverPriority(raw?: string): Set<string> {
+  const parts = (raw || DEFAULT_RESOLVER_PRIORITY)
+    .split(",")
+    .map(p => p.trim().toLowerCase())
+    .filter(p => p === "monochrome" || p === "lastwave" || p === "qobuz");
+  if (parts.length === 0) {
+    return new Set(["monochrome"]);
+  }
+  const enabled = new Set(parts);
+  enabled.add("monochrome");
+  return enabled;
+}
 
 const bitchordAuth = createBitChordAuth({
   hosts: DEFAULT_HOSTS
@@ -651,6 +665,10 @@ export default {
     const lastwaveSecret = env.LASTWAVE_SECRET || DEFAULT_LASTWAVE_SECRET;
     const bridgeUrl = (env.UPSTREAM_BRIDGE_URL || DEFAULT_BRIDGE_URL).replace(/\/+$/, "");
     const qobuzUrl = (env.UPSTREAM_QOBUZ_URL || "").replace(/\/+$/, "");
+    const enabledResolvers = parseResolverPriority(env.RESOLVER_PRIORITY);
+    const useMonochrome = enabledResolvers.has("monochrome");
+    const useLastWave = enabledResolvers.has("lastwave");
+    const useQobuz = enabledResolvers.has("qobuz");
 
     // Dual-Mode Routing:
     // 1. Rooted mode (default): /manifest.json, /search, /stream/:id
@@ -688,7 +706,8 @@ export default {
         version: "2.2.0",
         authMode: isAuthMode,
         engine: "parallel",
-        lastwaveCooldownActive: Date.now() < lastwaveCooldownUntil
+        resolvers: Array.from(enabledResolvers),
+        lastwaveCooldownActive: useLastWave && Date.now() < lastwaveCooldownUntil
       }), {
         headers: { "Content-Type": "application/json", ...corsHeaders }
       });
@@ -715,8 +734,9 @@ export default {
         });
       }
 
-      const lwCoolingDown = Date.now() < lastwaveCooldownUntil;
-      const cacheKey = `${rawQuery.trim().toLowerCase()}|lw:${lwCoolingDown ? 0 : 1}`;
+      const lwCoolingDown = useLastWave && Date.now() < lastwaveCooldownUntil;
+      const priorityKey = Array.from(enabledResolvers).join(",");
+      const cacheKey = `${rawQuery.trim().toLowerCase()}|p:${priorityKey}|lw:${lwCoolingDown ? 0 : 1}`;
       const cached = searchCache.get(cacheKey);
       if (cached && (Date.now() - cached.cachedAt < SEARCH_CACHE_TTL)) {
         return new Response(JSON.stringify({ tracks: cached.data }), {
@@ -801,9 +821,9 @@ export default {
 
       // Note: Do NOT search bridgeUrl (Fly.io) here because Fly queries the same LastWave quota.
       const [monoRes, lwRes, qobuzRes] = await Promise.allSettled([
-        searchMonochrome(cleaned, 10),
-        searchLastWave(cleaned),
-        searchQobuz(cleaned)
+        useMonochrome ? searchMonochrome(cleaned, 10) : Promise.resolve([]),
+        useLastWave ? searchLastWave(cleaned) : Promise.resolve([]),
+        useQobuz ? searchQobuz(cleaned) : Promise.resolve([])
       ]);
 
       const monoTracks = monoRes.status === "fulfilled" ? monoRes.value : [];
@@ -811,12 +831,14 @@ export default {
       const qobuzTracks = qobuzRes.status === "fulfilled" ? qobuzRes.value : [];
 
       if (monoTracks.length === 0 && lwTracks.length === 0 && qobuzTracks.length === 0 && cleaned !== rawQuery.trim()) {
-        const [monoRaw, lwRaw] = await Promise.allSettled([
-          searchMonochrome(rawQuery.trim(), 10),
-          searchLastWave(rawQuery.trim())
+        const [monoRaw, lwRaw, qobuzRaw] = await Promise.allSettled([
+          useMonochrome ? searchMonochrome(rawQuery.trim(), 10) : Promise.resolve([]),
+          useLastWave ? searchLastWave(rawQuery.trim()) : Promise.resolve([]),
+          useQobuz ? searchQobuz(rawQuery.trim()) : Promise.resolve([])
         ]);
         if (monoRaw.status === "fulfilled") monoTracks.push(...monoRaw.value);
         if (lwRaw.status === "fulfilled") lwTracks.push(...lwRaw.value);
+        if (qobuzRaw.status === "fulfilled") qobuzTracks.push(...qobuzRaw.value);
       }
 
       const qTokens = significantTokens(cleaned);
@@ -1022,7 +1044,9 @@ export default {
           resolved = await resolveViaMonochromeMeta(meta, lastwaveUrl, lastwaveSecret);
         }
       } else if (baseId.startsWith("qobuz_")) {
-        resolved = await tryBridge(baseId);
+        if (useQobuz) {
+          resolved = await tryBridge(baseId);
+        }
         if (!resolved && meta) {
           resolved = await resolveViaMonochromeMeta(meta, lastwaveUrl, lastwaveSecret);
         }
@@ -1030,7 +1054,7 @@ export default {
         // Tidal / LastWave ID (possibly paired with ~m<monoId>)
         const preferDirect = qualityParam === "lossless";
         const tidalMetaPromise = !meta && /^\d+$/.test(baseId) ? fetchTidalTrackMeta(baseId) : Promise.resolve(null);
-        if (!preferDirect) {
+        if (useLastWave && !preferDirect) {
           resolved = await tryLastWave(baseId);
         }
         if (!resolved && (embeddedMonoId || meta?.monoId)) {
@@ -1043,10 +1067,10 @@ export default {
             resolved = await resolveViaMonochromeMeta(resolvedMeta, lastwaveUrl, lastwaveSecret);
           }
         }
-        if (!resolved && preferDirect) {
+        if (useLastWave && !resolved && preferDirect) {
           resolved = await tryLastWave(baseId);
         }
-        if (!resolved) {
+        if ((useLastWave || useQobuz) && !resolved) {
           resolved = await tryBridge(baseId);
         }
       }

@@ -4,6 +4,7 @@ compatibility_date = "2024-04-01"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
+RESOLVER_PRIORITY = "monochrome"
 UPSTREAM_BRIDGE_URL = "https://lossless-bridge.fly.dev/sksalapur"
 LASTWAVE_URL = "https://lastwaveaddons.clashprojects.qd.je/a/4577b43d1be84f289dc05c9f794a8e992f0a58b99b2db3a49096a77ea22c911e"
 LASTWAVE_SECRET = "36d96a751b12ee481c281a8a8e64c482d0c1634a22061ab72f40175017818b85"
