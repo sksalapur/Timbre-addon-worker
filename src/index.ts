@@ -44,6 +44,8 @@ const LASTWAVE_COOLDOWN_MS = 3 * 60 * 1000; // 3 mins backoff when quota/pranks 
 const searchCache = new Map<string, CacheEntry<any[]>>();
 const streamCache = new Map<string, CacheEntry<any>>();
 const trackMetaCache = new Map<string, TrackMeta>();
+const badUrlCache = new Map<string, number>();
+const BAD_URL_TTL_MS = 30 * 60 * 1000; // 30 mins negative cache for AAC/prank URLs
 
 let lastwavePrankStreak = 0;
 let lastwaveCooldownUntil = 0;
@@ -237,6 +239,8 @@ async function verifyAndNormalizeStream(
 ): Promise<any | null> {
   const streamUrl = rawStream?.url;
   if (isSuspectPrankUrl(streamUrl)) return null;
+  const badExp = badUrlCache.get(streamUrl);
+  if (badExp && Date.now() < badExp) return null;
 
   let pathname = "";
   let hostname = "";
@@ -363,8 +367,14 @@ async function verifyAndNormalizeStream(
     if (head[4] === 0x66 && head[5] === 0x74 && head[6] === 0x79 && head[7] === 0x70) {
       const hasFlacBox = indexOfBytes(head, "fLaC") !== -1 || indexOfBytes(head, "dfLa") !== -1;
       const hasAlacBox = indexOfBytes(head, "alac") !== -1;
-      if (!hasFlacBox && !hasAlacBox) return null;
-      if (!passesDurationSizeSanity(totalBytes, durationHintSec)) return null;
+      if (!hasFlacBox && !hasAlacBox) {
+        setBounded(badUrlCache, streamUrl, Date.now() + BAD_URL_TTL_MS);
+        return null;
+      }
+      if (!passesDurationSizeSanity(totalBytes, durationHintSec)) {
+        setBounded(badUrlCache, streamUrl, Date.now() + BAD_URL_TTL_MS);
+        return null;
+      }
 
       const codec = hasFlacBox ? "flac" : "alac";
       const bitDepth = Number(rawStream.bitDepth) || 16;
@@ -537,30 +547,37 @@ async function resolveViaMonochromeMeta(
 
   const seenIds = new Set<string>();
   const allCandidates: any[] = [];
-  for (const q of queries) {
-    const hits = await searchMonochrome(q, 8);
-    for (const c of hits) {
+  const searchBatches = await Promise.allSettled(queries.map(q => searchMonochrome(q, 8)));
+  for (const res of searchBatches) {
+    if (res.status !== "fulfilled") continue;
+    for (const c of res.value) {
       if (!seenIds.has(c._monoId)) {
         seenIds.add(c._monoId);
         allCandidates.push(c);
       }
     }
-    if (allCandidates.some(c => scoreMonoCandidate(c, meta) >= 120)) break;
   }
 
   const ranked = allCandidates
     .map(c => ({ candidate: c, score: scoreMonoCandidate(c, meta) }))
     .filter(x => x.score >= 60)
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 4);
 
-  for (const { candidate } of ranked.slice(0, 3)) {
-    const verified = await verifyAndNormalizeStream(
-      { url: `${MONOCHROME_TRACKS_URL}/track/${candidate._monoId}`, format: "flac" },
-      lastwaveUrl,
-      lastwaveSecret,
-      candidate.duration || meta.duration
-    );
-    if (verified) return verified;
+  if (ranked.length === 0) return null;
+
+  const probes = await Promise.allSettled(
+    ranked.map(({ candidate }) =>
+      verifyAndNormalizeStream(
+        { url: `${MONOCHROME_TRACKS_URL}/track/${candidate._monoId}`, format: "flac" },
+        lastwaveUrl,
+        lastwaveSecret,
+        candidate.duration || meta.duration
+      )
+    )
+  );
+  for (const p of probes) {
+    if (p.status === "fulfilled" && p.value) return p.value;
   }
   return null;
 }
@@ -802,9 +819,51 @@ export default {
         if (lwRaw.status === "fulfilled") lwTracks.push(...lwRaw.value);
       }
 
+      const qTokens = significantTokens(cleaned);
+      const searchRelBucket = (t: any): number => {
+        if (!qTokens.length) return 0;
+        const hay = normalizeText(`${t.title || ""} ${t.artist || ""}`);
+        const hits = qTokens.filter(tok => hay.includes(tok)).length;
+        const exactTitleBonus = normalizeText(t.title || "") && normalizeText(cleaned).includes(normalizeText(t.title || "")) ? 2 : 0;
+        return hits * 2 + exactTitleBonus;
+      };
+      monoTracks.sort((a, b) => searchRelBucket(b) - searchRelBucket(a));
+
+      // Concurrently pre-verify top 4 relevant Monochrome hits so AAC-only entries are dropped
+      // before BitChord picks #1 and valid FLAC hits warm streamCache for instant /stream.
+      const badMonoIds = new Set<string>();
+      const topMonoToVerify = monoTracks.slice(0, 4);
+      if (topMonoToVerify.length > 0) {
+        const probeRes = await Promise.allSettled(
+          topMonoToVerify.map(m =>
+            verifyAndNormalizeStream(
+              { url: `${MONOCHROME_TRACKS_URL}/track/${m._monoId}`, format: "flac" },
+              lastwaveUrl,
+              lastwaveSecret,
+              m.duration || 0
+            )
+          )
+        );
+        for (let i = 0; i < topMonoToVerify.length; i++) {
+          const m = topMonoToVerify[i];
+          const res = probeRes[i];
+          if (res.status === "fulfilled" && res.value) {
+            m.bitDepth = res.value.bitDepth || m.bitDepth;
+            m.sampleRate = res.value.sampleRate || m.sampleRate;
+            m.quality = res.value.quality || m.quality;
+            m._verifiedFlac = true;
+            setBounded(streamCache, m.id, { data: res.value, cachedAt: Date.now() });
+          } else {
+            badMonoIds.add(String(m._monoId));
+          }
+        }
+      }
+
+      const cleanMonoTracks = monoTracks.filter(m => !badMonoIds.has(String(m._monoId)));
+
       // Attach Monochrome fallback IDs onto matching LastWave tracks for stateless cross-fallback on isolate cold start
       for (const lw of lwTracks) {
-        const match = findMatchingMono(lw, monoTracks);
+        const match = findMatchingMono(lw, cleanMonoTracks);
         const lwBaseId = lw.id;
         setBounded(trackMetaCache, lwBaseId, {
           title: lw.title,
@@ -819,7 +878,7 @@ export default {
         }
       }
 
-      for (const m of monoTracks) {
+      for (const m of cleanMonoTracks) {
         setBounded(trackMetaCache, m.id, {
           title: m.title,
           artist: m.artist,
@@ -830,13 +889,21 @@ export default {
         });
       }
 
-      const rawCombined = [...monoTracks, ...qobuzTracks, ...lwTracks];
+      const rawCombined = [...cleanMonoTracks, ...qobuzTracks, ...lwTracks];
       const seenIds = new Set<string>();
       const seenTitles = new Set<string>();
       const deduped: any[] = [];
 
-      // Rank candidates so direct native FLAC / verified Hi-Res order properly
-      rawCombined.sort((a, b) => qualityScore(b) - qualityScore(a));
+      // Sort: verified Monochrome FLAC first, then query token relevance, then quality tier
+      rawCombined.sort((a, b) => {
+        const va = a._verifiedFlac ? 1 : 0;
+        const vb = b._verifiedFlac ? 1 : 0;
+        if (va !== vb) return vb - va;
+        const ra = searchRelBucket(a);
+        const rb = searchRelBucket(b);
+        if (ra !== rb) return rb - ra;
+        return qualityScore(b) - qualityScore(a);
+      });
 
       for (const t of rawCombined) {
         const idKey = String(t.id);
@@ -846,6 +913,7 @@ export default {
           if (titleKey) seenTitles.add(titleKey);
           const cleanTrack = { ...t };
           delete cleanTrack._monoId;
+          delete cleanTrack._verifiedFlac;
           deduped.push(cleanTrack);
         }
       }
@@ -961,6 +1029,7 @@ export default {
       } else {
         // Tidal / LastWave ID (possibly paired with ~m<monoId>)
         const preferDirect = qualityParam === "lossless";
+        const tidalMetaPromise = !meta && /^\d+$/.test(baseId) ? fetchTidalTrackMeta(baseId) : Promise.resolve(null);
         if (!preferDirect) {
           resolved = await tryLastWave(baseId);
         }
@@ -968,7 +1037,7 @@ export default {
           resolved = await tryMonoDirect(embeddedMonoId || meta?.monoId || "");
         }
         if (!resolved) {
-          const resolvedMeta = meta || (await fetchTidalTrackMeta(baseId));
+          const resolvedMeta = meta || (await tidalMetaPromise);
           if (resolvedMeta) {
             setBounded(trackMetaCache, baseId, resolvedMeta);
             resolved = await resolveViaMonochromeMeta(resolvedMeta, lastwaveUrl, lastwaveSecret);
